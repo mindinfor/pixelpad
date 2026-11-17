@@ -4,6 +4,20 @@ PixelPad 是一个轻量的 macOS 图片编辑器，适合给截图加字、裁�
 
 [下载 macOS 版](https://github.com/mindinfor/pixelpad/releases/latest) · [查看 MIT 许可证](LICENSE)
 
+## 界面预览
+
+**工具栏与画布文字**
+
+在画布上直接输入文字，并通过工具栏调整字体、字号和颜色。
+
+![PixelPad 的工具栏和画布中的示例文字](docs/screenshots/toolbar-and-text.png)
+
+**像素网格**
+
+同一段文字放大到 2092%，浅灰网格的每一格对应原图的 1 个像素。
+
+![PixelPad 放大到 2092% 后显示的字形像素和网格](docs/screenshots/pixel-grid.png)
+
 ## 功能与特点
 
 | 功能 | 用法 |
