@@ -193,6 +193,13 @@ struct Document {
     var background: NSImage?
     var items: [Item] = []
     var backgroundSize: NSSize?
+    var usesCentimeters = false
+
+    static let pixelsPerCentimeter: CGFloat = 300 / 2.54
+    var printSize: NSSize {
+        let pointsPerPixel: CGFloat = 72 / 300
+        return NSSize(width: size.width * pointsPerPixel, height: size.height * pointsPerPixel)
+    }
 
     func resizedCanvas(to newSize: NSSize, scalingContentBy factor: CGFloat) -> Document {
         var result = self
@@ -310,7 +317,7 @@ struct Document {
             transform(context)
             draw()
         }) else { return nil }
-        return Document(size: size, background: Self.image(from: bitmap))
+        return Document(size: size, background: Self.image(from: bitmap), usesCentimeters: usesCentimeters)
     }
 
     private func render(_ region: NSRect) -> NSBitmapImageRep? {
@@ -929,6 +936,7 @@ private enum InterfaceColor {
 }
 
 private final class ToolbarButton: NSButton {
+    static let height: CGFloat = 26
     var isPrimary = false { didSet { needsDisplay = true } }
     private var hoverArea: NSTrackingArea?
     private var hovered = false { didSet { needsDisplay = true } }
@@ -949,7 +957,10 @@ private final class ToolbarButton: NSButton {
         if isEnabled && (isPrimary || state == .on || hovered || isHighlighted) {
             let color = isPrimary ? InterfaceColor.export : InterfaceColor.selected
             color.setFill()
-            NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 6, yRadius: 6).fill()
+            let highlightHeight = min(bounds.height, Self.height) - 2
+            let highlight = NSRect(x: bounds.minX + 1, y: bounds.midY - highlightHeight / 2,
+                                   width: bounds.width - 2, height: highlightHeight)
+            NSBezierPath(roundedRect: highlight, xRadius: 6, yRadius: 6).fill()
         }
         super.draw(dirtyRect)
     }
@@ -1011,10 +1022,7 @@ final class ZoomScrollView: NSScrollView {
 
     override func scrollWheel(with event: NSEvent) {
         let vertical = event.scrollingDeltaY
-        let isVertical = abs(vertical) > abs(event.scrollingDeltaX)
-        let zoomRequested = event.modifierFlags.contains(.command)
-            || (isVertical && !event.modifierFlags.contains(.shift))
-        if vertical != 0, zoomRequested, let zoomWheel {
+        if vertical != 0, event.modifierFlags.contains(.command), let zoomWheel {
             let steps = event.hasPreciseScrollingDeltas ? vertical / 20 : vertical
             zoomWheel(pow(1.15, min(4, max(-4, steps))), event.locationInWindow)
         } else {
@@ -1104,25 +1112,39 @@ private final class CanvasSizeForm: NSObject, NSTextFieldDelegate {
     let lock = NSButton(checkboxWithTitle: "锁定宽高比", target: nil, action: nil)
     private let original: NSSize
     private var editedWidth = true
-    private var percent = false
+    private enum Unit: Int { case pixels, percent, centimeters }
+    private var inputUnit: Unit
+    var usesCentimeters: Bool { inputUnit == .centimeters }
+    var changesDisplayUnit: Bool { inputUnit != .percent }
 
-    init(size: NSSize) {
+    init(size: NSSize, creating: Bool = false, usesCentimeters: Bool = false) {
         original = size
+        inputUnit = .pixels
         width = NSTextField(string: String(Int(size.width)))
         height = NSTextField(string: String(Int(size.height)))
         super.init()
         mode.addItems(withTitles: ["仅调整画布", "画布和内容等比缩放"])
         mode.target = self
         mode.action = #selector(changeMode)
-        unit.addItems(withTitles: ["像素", "百分比"])
+        unit.addItems(withTitles: ["像素", "百分比", "厘米"])
+        unit.item(at: Unit.percent.rawValue)?.isHidden = creating
         unit.target = self
         unit.action = #selector(changeUnit)
-        lock.state = .on
+        lock.state = creating ? .off : .on
         lock.target = self
         lock.action = #selector(syncDimensions)
         for field in [width, height] {
             field.delegate = self
-            field.widthAnchor.constraint(equalToConstant: 74).isActive = true
+            field.widthAnchor.constraint(equalToConstant: 94).isActive = true
+        }
+        if creating {
+            unit.selectItem(at: Unit.centimeters.rawValue)
+            inputUnit = .centimeters
+            width.stringValue = "10"
+            height.stringValue = "15"
+        } else if usesCentimeters {
+            unit.selectItem(at: Unit.centimeters.rawValue)
+            changeUnit()
         }
     }
 
@@ -1133,25 +1155,37 @@ private final class CanvasSizeForm: NSObject, NSTextFieldDelegate {
     }
 
     private func format(_ value: CGFloat) -> String {
-        if !percent { return String(format: "%.0f", value.rounded()) }
+        if inputUnit == .pixels { return String(format: "%.0f", value.rounded()) }
         return String(format: "%.8f", value).replacingOccurrences(of: #"\.?0+$"#, with: "", options: .regularExpression)
+    }
+
+    private func pixelsPerUnit(_ unit: Unit, originalSize: CGFloat) -> CGFloat {
+        switch unit {
+        case .pixels: return 1
+        case .percent: return originalSize / 100
+        case .centimeters: return Document.pixelsPerCentimeter
+        }
     }
 
     private var sourceField: NSTextField { editedWidth ? width : height }
     private var sourceSize: CGFloat { editedWidth ? original.width : original.height }
     var scale: CGFloat {
         guard mode.indexOfSelectedItem == 1, let value = number(sourceField) else { return 1 }
-        return percent ? value / 100 : value / sourceSize
+        return value * pixelsPerUnit(inputUnit, originalSize: sourceSize) / sourceSize
     }
 
     var size: NSSize? {
         guard let w = number(width), let h = number(height) else { return nil }
-        let pixelsWide = percent ? max(1, (original.width * w / 100).rounded()) : w
-        let pixelsHigh = percent ? max(1, (original.height * h / 100).rounded()) : h
-        guard (1...16_384).contains(pixelsWide), (1...16_384).contains(pixelsHigh),
-              pixelsWide.rounded() == pixelsWide, pixelsHigh.rounded() == pixelsHigh,
-              pixelsWide * pixelsHigh <= 64_000_000 else { return nil }
-        return NSSize(width: pixelsWide, height: pixelsHigh)
+        let rawWidth = w * pixelsPerUnit(inputUnit, originalSize: original.width)
+        let rawHeight = h * pixelsPerUnit(inputUnit, originalSize: original.height)
+        let pixelsWide = inputUnit == .pixels ? rawWidth : rawWidth.rounded()
+        let pixelsHigh = inputUnit == .pixels ? rawHeight : rawHeight.rounded()
+        let validatedWidth = inputUnit == .percent ? max(1, pixelsWide) : pixelsWide
+        let validatedHeight = inputUnit == .percent ? max(1, pixelsHigh) : pixelsHigh
+        guard (1...16_384).contains(validatedWidth), (1...16_384).contains(validatedHeight),
+              validatedWidth.rounded() == validatedWidth, validatedHeight.rounded() == validatedHeight,
+              validatedWidth * validatedHeight <= 64_000_000 else { return nil }
+        return NSSize(width: validatedWidth, height: validatedHeight)
     }
 
     func controlTextDidChange(_ notification: Notification) {
@@ -1160,11 +1194,14 @@ private final class CanvasSizeForm: NSObject, NSTextFieldDelegate {
     }
 
     @objc private func changeUnit() {
-        percent = unit.indexOfSelectedItem == 1
+        guard let nextUnit = Unit(rawValue: unit.indexOfSelectedItem) else { return }
+        let previousUnit = inputUnit
+        inputUnit = nextUnit
         for (field, originalSize) in [(width, original.width), (height, original.height)] {
             if let value = number(field) {
-                let converted = percent ? value / originalSize * 100 : max(1, value * originalSize / 100)
-                field.stringValue = format(converted)
+                let pixels = value * pixelsPerUnit(previousUnit, originalSize: originalSize)
+                let converted = pixels / pixelsPerUnit(nextUnit, originalSize: originalSize)
+                field.stringValue = format(nextUnit == .pixels ? max(1, converted) : converted)
             }
         }
         syncDimensions()
@@ -1181,7 +1218,54 @@ private final class CanvasSizeForm: NSObject, NSTextFieldDelegate {
         guard lock.state == .on, let value = number(sourceField) else { return }
         let linkedField = editedWidth ? height : width
         let linkedSize = editedWidth ? original.height : original.width
-        linkedField.stringValue = format(percent ? value : max(1, linkedSize * value / sourceSize))
+        let factor = value * pixelsPerUnit(inputUnit, originalSize: sourceSize) / sourceSize
+        let linkedValue = linkedSize * factor / pixelsPerUnit(inputUnit, originalSize: linkedSize)
+        linkedField.stringValue = format(inputUnit == .pixels ? max(1, linkedValue) : linkedValue)
+    }
+}
+
+private final class PhotoPrintView: NSView {
+    private let photo: NSImage
+    private let photoSize: NSSize
+    private var turnsPhoto = false
+
+    init(photo: NSImage, size: NSSize) {
+        self.photo = photo
+        photoSize = size
+        super.init(frame: NSRect(origin: .zero, size: size))
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func knowsPageRange(_ range: NSRangePointer) -> Bool {
+        range.pointee = NSRange(location: 1, length: 1)
+        return true
+    }
+
+    override func rectForPage(_ page: Int) -> NSRect {
+        guard page == 1, let info = NSPrintOperation.current?.printInfo else { return .zero }
+        let printable = info.imageablePageBounds.size
+        let scale = info.scalingFactor > 0 ? info.scalingFactor : 1
+        let uprightFit = min(printable.width / photoSize.width, printable.height / photoSize.height)
+        let turnedFit = min(printable.width / photoSize.height, printable.height / photoSize.width)
+        // Only turn the photo when its current orientation would lose content.
+        turnsPhoto = uprightFit < scale && turnedFit > uprightFit
+        let displayedSize = turnsPhoto ? NSSize(width: photoSize.height, height: photoSize.width) : photoSize
+        let pageSize = NSSize(width: min(displayedSize.width, printable.width / scale),
+                              height: min(displayedSize.height, printable.height / scale))
+        frame = NSRect(origin: .zero, size: pageSize)
+        return bounds
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.clip(to: bounds)
+        context.translateBy(x: bounds.midX, y: bounds.midY)
+        if turnsPhoto { context.rotate(by: .pi / 2) }
+        photo.draw(in: NSRect(x: -photoSize.width / 2, y: -photoSize.height / 2,
+                              width: photoSize.width, height: photoSize.height))
     }
 }
 
@@ -1227,10 +1311,12 @@ final class Editor: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextVie
         export.isPrimary = true
         export.contentTintColor = .white
         let fileActions = toolbarGroup([
+            iconButton("doc.badge.plus", "新建画布", #selector(newCanvas(_:))),
             iconButton("folder", "打开图片", #selector(openImage(_:))),
             iconButton("clipboard", "粘贴", #selector(paste(_:))),
             iconButton("arrow.uturn.backward", "撤销", #selector(undo(_:))),
-            export
+            export,
+            iconButton("printer", "打印照片", #selector(printPhoto(_:)))
         ])
         let drawingSymbols = ["cursorarrow", "selection.pin.in.out", "pencil", "paintbrush",
                               "eraser", "drop.fill", "line.diagonal", "rectangle", "circle", "eyedropper", "textformat"]
@@ -1342,7 +1428,10 @@ final class Editor: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextVie
         let main = NSMenu()
         let definitions: [(String, [(String, Selector, String)])] = [
             ("PixelPad", [("退出 PixelPad", #selector(NSApplication.terminate(_:)), "q")]),
-            ("文件", [("打开图片…", #selector(openImage(_:)), "o"), ("另存 PNG…", #selector(savePNG(_:)), "s")]),
+            ("文件", [("新建画布…", #selector(newCanvas(_:)), "n"),
+                      ("打开图片…", #selector(openImage(_:)), "o"),
+                      ("另存 PNG…", #selector(savePNG(_:)), "s"),
+                      ("打印照片…", #selector(printPhoto(_:)), "p")]),
             ("编辑", [("撤销", #selector(undo(_:)), "z"), ("重做", #selector(redo(_:)), "Z"),
                      ("剪切", #selector(cut(_:)), "x"), ("复制", #selector(copy(_:)), "c"),
                      ("粘贴", #selector(paste(_:)), "v"), ("全选像素", #selector(selectAllPixels(_:)), "a"),
@@ -1369,7 +1458,14 @@ final class Editor: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextVie
 
     func setDirty(_ value: Bool) {
         let size = canvas.document.size
-        pixelSize.stringValue = "\(Int(size.width)) × \(Int(size.height)) px"
+        let pixels = "\(Int(size.width)) × \(Int(size.height)) px"
+        if canvas.document.usesCentimeters {
+            pixelSize.stringValue = "\(formatDimension(size.width, inCentimeters: true)) × \(formatDimension(size.height, inCentimeters: true)) cm"
+            pixelSize.toolTip = pixels
+        } else {
+            pixelSize.stringValue = pixels
+            pixelSize.toolTip = nil
+        }
         dirty = value
         window.title = "\(filename) — PixelPad"
         window.isDocumentEdited = value
@@ -1466,7 +1562,7 @@ final class Editor: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextVie
         button.isBordered = false
         button.contentTintColor = InterfaceColor.icon
         button.widthAnchor.constraint(equalToConstant: 29).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        button.heightAnchor.constraint(equalToConstant: ToolbarButton.height).isActive = true
     }
 
     private func configureIcon(_ button: NSButton, symbol: String, label: String) {
@@ -1611,13 +1707,28 @@ final class Editor: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextVie
         window.makeFirstResponder(canvas)
     }
 
+    private func formatDimension(_ pixels: CGFloat, inCentimeters: Bool) -> String {
+        let value = inCentimeters ? pixels / Document.pixelsPerCentimeter : pixels
+        return String(format: "%.2f", value).replacingOccurrences(of: #"\.?0+$"#, with: "", options: .regularExpression)
+    }
+
     private func showSelection(_ frame: NSRect?) {
-        guard let frame else { selectionSize.stringValue = ""; return }
-        func pixels(_ value: CGFloat) -> String {
-            String(format: "%.2f", value).replacingOccurrences(of: #"(\.0+|(?<=\.[0-9])0)$"#,
-                                                               with: "", options: .regularExpression)
+        guard let frame else {
+            selectionSize.stringValue = ""
+            selectionSize.toolTip = nil
+            return
         }
-        selectionSize.stringValue = "X \(pixels(frame.minX))  Y \(pixels(frame.minY))    \(pixels(frame.width)) × \(pixels(frame.height)) px"
+        func dimensions(inCentimeters: Bool) -> String {
+            let x = formatDimension(frame.minX, inCentimeters: inCentimeters)
+            let y = formatDimension(frame.minY, inCentimeters: inCentimeters)
+            let width = formatDimension(frame.width, inCentimeters: inCentimeters)
+            let height = formatDimension(frame.height, inCentimeters: inCentimeters)
+            let unit = inCentimeters ? "cm" : "px"
+            return "X \(x)  Y \(y)    \(width) × \(height) \(unit)"
+        }
+        let inCentimeters = canvas.document.usesCentimeters
+        selectionSize.stringValue = dimensions(inCentimeters: inCentimeters)
+        selectionSize.toolTip = inCentimeters ? dimensions(inCentimeters: false) : nil
     }
 
     @objc private func changeBrushMode(_ sender: NSButton) {
@@ -1675,37 +1786,60 @@ final class Editor: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextVie
     @objc private func crop(_ sender: Any?) {
         commitText()
         guard let region = canvas.pixelSelection, let image = canvas.document.image(in: region) else { NSSound.beep(); return }
-        canvas.transform(Document(size: region.size, background: image))
+        canvas.transform(Document(size: region.size, background: image,
+                                  usesCentimeters: canvas.document.usesCentimeters))
+        fit(nil)
+    }
+
+    @objc private func newCanvas(_ sender: Any?) {
+        let form = CanvasSizeForm(size: canvas.document.size, creating: true)
+        guard let size = requestCanvasSize(form, creating: true), confirmClose() else { return }
+        canvas.replace(Document(size: size, usesCentimeters: form.usesCentimeters))
+        filename = "未命名"
+        setDirty(false)
         fit(nil)
     }
 
     @objc private func resizeImage(_ sender: Any?) {
         commitText()
-        let form = CanvasSizeForm(size: canvas.document.size)
+        let original = canvas.document
+        let form = CanvasSizeForm(size: original.size, usesCentimeters: original.usesCentimeters)
+        guard let size = requestCanvasSize(form, creating: false) else { return }
+        let usesCentimeters = form.changesDisplayUnit ? form.usesCentimeters : original.usesCentimeters
+        guard size != original.size || usesCentimeters != original.usesCentimeters else { return }
+        var resized = size == original.size ? original : original.resizedCanvas(to: size, scalingContentBy: form.scale)
+        resized.usesCentimeters = usesCentimeters
+        canvas.transform(resized)
+        fit(nil)
+    }
+
+    private func requestCanvasSize(_ form: CanvasSizeForm, creating: Bool) -> NSSize? {
         let dimensions = toolbarGroup([
             NSTextField(labelWithString: "宽"), form.width,
             NSTextField(labelWithString: "高"), form.height
         ])
-        let accessory = NSStackView(views: [toolbarGroup([form.mode, form.unit]), dimensions, form.lock])
+        let unitControls = creating ? [form.unit] : [form.mode, form.unit]
+        let rows = [toolbarGroup(unitControls), dimensions]
+        let accessory = NSStackView(views: creating ? rows : rows + [form.lock])
         accessory.orientation = .vertical
         accessory.alignment = .leading
         accessory.spacing = 10
-        accessory.frame = NSRect(x: 0, y: 0, width: 270, height: 96)
+        accessory.frame = NSRect(x: 0, y: 0, width: 284, height: creating ? 64 : 96)
         let alert = NSAlert()
-        alert.messageText = "调整画布尺寸"
-        alert.informativeText = "画布以左上角为基准。缩小时，超出画布的内容会隐藏。"
+        alert.messageText = creating ? "新建画布" : "调整画布尺寸"
+        alert.informativeText = creating
+            ? "厘米尺寸按 300 像素/英寸换算。"
+            : "厘米尺寸按 300 像素/英寸换算。调整以左上角为基准。"
         alert.accessoryView = accessory
-        alert.addButton(withTitle: "应用")
+        alert.addButton(withTitle: creating ? "创建" : "应用")
         alert.addButton(withTitle: "取消")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        form.syncDimensions()
-        guard let size = form.size else {
-            error("请输入有效的像素宽高，单边最多 16384 像素，总像素最多 64000000。")
-            return
+        while alert.runModal() == .alertFirstButtonReturn {
+            alert.window.makeFirstResponder(nil)
+            form.syncDimensions()
+            if let size = form.size { return size }
+            error("请输入有效的宽高。单边最多 16384 像素，总像素最多 64000000。")
         }
-        guard size != canvas.document.size else { return }
-        canvas.transform(canvas.document.resizedCanvas(to: size, scalingContentBy: form.scale))
-        fit(nil)
+        return nil
     }
 
     @objc private func showTransforms(_ sender: NSButton) {
@@ -1949,6 +2083,27 @@ final class Editor: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextVie
         let available = scroll.contentSize
         let paper = canvas.document.size
         canvas.zoom = max(0.01, min(1, min(available.width / paper.width, available.height / paper.height)))
+    }
+
+    @objc private func printPhoto(_ sender: Any?) {
+        commitText()
+        let document = canvas.document
+        let size = document.printSize
+        guard let photo = document.image(in: NSRect(origin: .zero, size: document.size)) else {
+            error("无法生成打印图像。")
+            return
+        }
+        let page = PhotoPrintView(photo: photo, size: size)
+
+        let info = NSPrintInfo.shared.copy() as! NSPrintInfo
+        info.orientation = size.width > size.height ? .landscape : .portrait
+        info.scalingFactor = 1
+        info.isHorizontallyCentered = true
+        info.isVerticallyCentered = true
+        let operation = NSPrintOperation(view: page, printInfo: info)
+        operation.jobTitle = filename
+        operation.printPanel.options.formUnion([.showsPaperSize, .showsOrientation, .showsScaling, .showsPreview])
+        operation.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
     }
 
     @objc func savePNG(_ sender: Any?) { _ = exportPNG() }
